@@ -1,0 +1,1 @@
+install requests in your kali as " pip install requests"

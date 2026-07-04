@@ -32,7 +32,10 @@ def parse_arguments():
                         help="Detect web technologies in use")
     parser.add_argument("--report", action="store_true",
                         help="Save results to reports/ as .txt and .html")
-    # Run everything at once.
+    parser.add_argument("--whois", action="store_true", help="Run WHOIS lookup")
+    parser.add_argument("--dns", action="store_true", help="Enumerate DNS records (A, MX, TXT, NS)")
+    parser.add_argument("--subdomains", action="store_true", help="Passive subdomain enumeration") 
+# Run everything at once.
     parser.add_argument("--all", action="store_true",
                         help="Run every available recon module")
 
@@ -47,7 +50,8 @@ def main():
     args = parse_arguments()
 
     # If a target was given but no module chosen, warn instead of doing nothing.
-    any_module = (args.ports or args.banner or args.tech or args.all)
+    any_module = (args.ports or args.banner or args.tech or
+                  args.whois or args.dns or args.subdomains or args.all)
     if not any_module:
         print("[!] No recon module selected. Use --ports, --banner, --tech, or --all.")
         print("    Run 'python3 recon.py -h' to see all options.")
@@ -71,13 +75,25 @@ def main():
         from modules import tech_detect
         all_results["tech"] = tech_detect.run(args.target, args.verbose)
     
+    if args.whois or args.all:
+        from modules import whois_lookup
+        all_results["whois"] = whois_lookup.run(args.target, args.verbose)
+
+    if args.dns or args.all:
+        from modules import dns_enum
+        all_results["dns"] = dns_enum.run(args.target, args.verbose)
+
+    if args.subdomains or args.all:
+        from modules import subdomain_enum
+        all_results["subdomains"] = subdomain_enum.run(args.target, args.verbose)
+     
     if args.report and all_results:
         from utils import reporter
         txt_path, html_path = reporter.generate_report(args.target, all_results)
         print(f"\n[*] Report saved:")
         print(f"    {txt_path}")
         print(f"    {html_path}")
-    
+
         print("\n[*] Recon complete.")
 
 

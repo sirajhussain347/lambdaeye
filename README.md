@@ -43,6 +43,8 @@ Python dependencies (see `requirements.txt`):
 - `dnspython`
 - `python-whois`
 
+Alternatively, use **Docker** (see below) and skip the Python setup entirely.
+
 ---
 
 ## Installation
@@ -108,6 +110,68 @@ python3 modules/dns_enum.py example.com
 
 ---
 
+## Running with Docker
+
+A `Dockerfile` is included, so you can run LambdaEye without installing Python or any dependencies on your host machine.
+
+### Build the image
+
+From the project root (where the `Dockerfile` lives):
+
+```bash
+docker build -t lambdaeye .
+```
+
+### Run it
+
+The image's entrypoint is `python3 recon.py`, so anything you'd normally pass to `recon.py` goes after the image name.
+
+```bash
+# Show the help menu (default if no target is given)
+docker run --rm lambdaeye
+
+# Passive + active recon on a target
+docker run --rm lambdaeye example.com --all -v
+
+# A single module
+docker run --rm lambdaeye scanme.nmap.org --ports
+```
+
+### Saving reports to your host machine
+
+The container writes reports to `/app/reports`. To keep them after the container exits, mount a local `reports/` folder as a volume:
+
+```bash
+mkdir -p reports
+chmod 777 reports   # ensures the container's non-root user can write to it
+
+docker run --rm -v "$PWD/reports:/app/reports" lambdaeye example.com --all --report
+```
+
+> **Permission errors?** The container runs as a non-root user for security. If Docker auto-creates the `reports/` folder on your host (owned by root), the container won't be able to write to it. Either run `chmod 777 reports` on the host folder first, or run the container with your own user ID instead:
+>
+> ```bash
+> docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/reports:/app/reports" lambdaeye example.com --all --report
+> ```
+
+### Docker one-liners cheat sheet
+
+```bash
+# Build
+docker build -t lambdaeye .
+
+# Help menu
+docker run --rm lambdaeye
+
+# Full recon with report saved locally
+docker run --rm -v "$PWD/reports:/app/reports" lambdaeye example.com --all --report
+
+# Active recon only, verbose
+docker run --rm lambdaeye example.com --ports --banner --tech -v
+```
+
+---
+
 ## Sample Output
 
 ```
@@ -148,6 +212,7 @@ lambdaeye/
 ├── utils/
 │   └── reporter.py       # Builds .txt and .html reports
 ├── reports/              # Generated reports (git-ignored)
+├── Dockerfile             # Container build for running LambdaEye without local Python setup
 ├── requirements.txt
 └── README.md
 ```

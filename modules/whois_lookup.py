@@ -42,6 +42,15 @@ def run(target, verbose=False):
 
     try:
         data = pywhois.whois(target)
+
+        # python-whois may return an object with all-None fields instead of
+        # raising an exception for certain unregistered domains.
+        if not data.domain_name:
+            results["status"] = "not_found"
+            results["data"]["error"] = "WHOIS: No registration record found."
+            print(f"[WHOIS]  Domain not found: {target}")
+            return results
+
         fields = {
             "domain_name": _stringify(data.domain_name),
             "registrar": _stringify(data.registrar),
@@ -56,9 +65,26 @@ def run(target, verbose=False):
         }
         results["data"] = fields
     except Exception as e:
-        results["status"] = "error"
-        results["data"]["error"] = str(e)
-        print(f"[WHOIS]  ERROR: {e}")
+        err_text = str(e)
+        # Detect "domain not found" responses.  Registry WHOIS servers embed
+        # the negative result inside a long legal-notice block which
+        # python-whois passes through as the exception message.
+        _NOT_FOUND_MARKERS = (
+            "no match for",
+            "not found",
+            "no data found",
+            "no entries found",
+            "domain not found",
+            "no information available",
+        )
+        if any(marker in err_text.lower() for marker in _NOT_FOUND_MARKERS):
+            results["status"] = "not_found"
+            results["data"]["error"] = "WHOIS: No registration record found."
+            print(f"[WHOIS]  Domain not found: {target}")
+        else:
+            results["status"] = "error"
+            results["data"]["error"] = err_text
+            print(f"[WHOIS]  ERROR: {err_text}")
         return results
 
     # Live output

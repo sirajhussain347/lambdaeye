@@ -23,11 +23,7 @@ def _stringify(value):
     return str(value)
 
 
-# python-whois has no dedicated parser for .pk (PKNIC). It falls back to the
-# generic parser, which looks for "Domain Name:" -- but PKNIC's real WHOIS
-# output uses "Domain:" instead, so domain_name always comes back None and
-# every .pk lookup is wrongly reported as "not_found". We bypass the library
-# for .pk and query PKNIC directly with the correct field names.
+
 PKNIC_SERVER = "whois.pknic.net.pk"
 PK_REGEX = {
     "domain_name": r"Domain:\s*(.+)",
@@ -134,8 +130,7 @@ def run(target, verbose=False):
         return results
     try:
         data = pywhois.whois(target)
-        # python-whois may return an object with all-None fields instead of
-        # raising an exception for certain unregistered domains.
+       
         if not data.domain_name:
             results["status"] = "not_found"
             results["data"]["error"] = "WHOIS: No registration record found."
@@ -156,9 +151,7 @@ def run(target, verbose=False):
         results["data"] = fields
     except Exception as e:
         err_text = str(e)
-        # Detect "domain not found" responses.  Registry WHOIS servers embed
-        # the negative result inside a long legal-notice block which
-        # python-whois passes through as the exception message.
+       
         _NOT_FOUND_MARKERS = (
             "no match for",
             "not found",

@@ -1,128 +1,105 @@
 #!/usr/bin/env python3
 """
-port_scan.py — Active recon module: socket-based port scanner.
+port_scan.py - Active recon module: socket-based port scanner.
+Checks which TCP ports are open on a target. Supports common ports,
+top-100, top-1000, or a custom range. Part of the LambdaEye tool.
 
-Checks which TCP ports are open on a target by attempting a connection
-to each one. Part of the LambdaRecon tool (active recon).
-
-Contract: exposes run(target, verbose=False) and returns a dict.
+Contract: exposes run(target, verbose=False, ports=None) and returns a dict.
 """
 
-import socket    # built-in: lets us open network connections
-import time      # built-in: to timestamp the scan
+import socket
 
-
-# A small set of the most common ports, with what usually runs on them.
-# We scan these by default so a beginner run is fast and readable.
 COMMON_PORTS = {
-    21:  "FTP",
-    22:  "SSH",
-    23:  "Telnet",
-    25:  "SMTP",
-    53:  "DNS",
-    80:  "HTTP",
-    110: "POP3",
-    143: "IMAP",
-    443: "HTTPS",
-    3306: "MySQL",
-    3389: "RDP",
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
+    110: "POP3", 143: "IMAP", 443: "HTTPS", 3306: "MySQL", 3389: "RDP",
     8080: "HTTP-alt",
 }
 
+# Top 100 most common ports (nmap-style short list).
+TOP_100 = [
+    7, 20, 21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993,
+    995, 1723, 3306, 3389, 5900, 8080, 8443, 8888, 20, 69, 123, 161, 162,
+    389, 636, 1433, 1521, 2049, 2082, 2083, 2086, 2087, 2095, 2096, 3000,
+    3128, 3268, 4444, 5000, 5060, 5432, 5601, 5985, 5986, 6379, 6443, 7001,
+    8000, 8008, 8081, 8181, 8291, 8834, 9000, 9090, 9200, 9300, 10000,
+    11211, 27017, 27018, 50000, 465, 587, 514, 873, 902, 990, 1080, 1194,
+    1701, 1900, 2000, 2121, 3690, 4022, 4433, 5222, 5269, 5555, 5672, 5800,
+    6000, 6667, 7000, 7070, 7443, 8009, 8010, 8443, 8880, 9091, 9999,
+]
+
 
 def scan_port(ip, port, timeout=1.0):
-    """
-    Try to connect to ONE port on the target IP.
-    Returns True if the port is open, False otherwise.
-    """
-    # AF_INET = IPv4, SOCK_STREAM = TCP (the reliable, connection-based type).
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-    # Don't wait forever on a dead port — give up after `timeout` seconds.
     sock.settimeout(timeout)
-
-    # connect_ex returns 0 if the connection succeeded (port open),
-    # or an error number if it failed (port closed/filtered).
-    # We use connect_ex instead of connect() because it doesn't crash
-    # on failure — it just returns a code, which is easier to handle.
     result = sock.connect_ex((ip, port))
-
-    sock.close()   # always close the door behind us
-
+    sock.close()
     return result == 0
 
 
-def run(target, verbose=False, ports=None):
-    """
-    Main entry point for this module (matches the team contract).
+def _resolve_port_list(ports, port_range, profile):
+    """Decide which ports to scan based on the options given."""
+    if ports:
+        return list(ports)
+    if port_range:
+        # port_range is a string like "1-1024"
+        try:
+            start, end = port_range.split("-")
+            return list(range(int(start), int(end) + 1))
+        except Exception:
+            return list(COMMON_PORTS.keys())
+    if profile == "top100":
+        return sorted(set(TOP_100))
+    if profile == "top1000":
+        return list(range(1, 1001))
+    return list(COMMON_PORTS.keys())
 
-    target  : domain or IP string, e.g. "scanme.nmap.org"
-    verbose : if True, print each port as we check it
-    ports   : optional list of ports to scan; defaults to COMMON_PORTS
 
-    Returns a dict of results.
+def run(target, verbose=False, ports=None, port_range=None, profile="common"):
     """
-    # This is the standard result skeleton every module returns,
-    # so the report module can treat all modules the same way.
+    Main entry point (matches the team contract).
+    Improvement 2: supports profile='common'|'top100'|'top1000' and
+    port_range='1-65535'.
+    """
     results = {
-        "module": "port_scan",
-        "status": "success",
-        "target": target,
-        "data": {
-            "resolved_ip": None,
-            "open_ports": [],
-            "scanned_count": 0,
-        },
+        "module": "port_scan", "status": "success", "target": target,
+        "data": {"resolved_ip": None, "open_ports": [], "scanned_count": 0},
     }
 
-    # STEP 1: turn the domain name into an IP address.
-    # Sockets connect to IPs, not names, so we resolve first.
-    # This also satisfies the task's "IP resolution details" requirement.
     try:
         ip = socket.gethostbyname(target)
         results["data"]["resolved_ip"] = ip
     except socket.gaierror:
-        # Couldn't resolve the name — record the failure and stop.
         results["status"] = "error"
         results["data"]["error"] = f"Could not resolve host: {target}"
+        print(f"[PORTS]  ERROR: could not resolve host -> {target}")
         return results
+
+    ports_to_scan = _resolve_port_list(ports, port_range, profile)
+    results["data"]["scanned_count"] = len(ports_to_scan)
 
     if verbose:
         print(f"[PORTS] Resolved {target} -> {ip}")
-        print(f"[PORTS] Scanning {len(ports or COMMON_PORTS)} ports...\n")
+        print(f"[PORTS] Scanning {len(ports_to_scan)} ports...\n")
 
-    # STEP 2: decide which ports to scan.
-    ports_to_scan = ports if ports else list(COMMON_PORTS.keys())
-    results["data"]["scanned_count"] = len(ports_to_scan)
-
-    # STEP 3: try each port, one by one.
     for port in ports_to_scan:
-        is_open = scan_port(ip, port)
-
-        if is_open:
+        if scan_port(ip, port):
             service = COMMON_PORTS.get(port, "unknown")
-            port_info = {"port": port, "service": service}
-            results["data"]["open_ports"].append(port_info)
-
-            # Always announce an OPEN port (this is the important signal).
+            results["data"]["open_ports"].append({"port": port, "service": service})
             print(f"[PORTS] Port {port:<5} OPEN   ({service})")
         elif verbose:
-            # Only mention CLOSED ports in verbose mode, to avoid noise.
             print(f"[PORTS] Port {port:<5} closed")
 
+    found = len(results["data"]["open_ports"])
     if verbose:
-        found = len(results["data"]["open_ports"])
         print(f"\n[PORTS] Done. {found} open port(s) found.")
+    elif found == 0:
+        print("[PORTS] No open ports found.")
 
     return results
 
 
-# Lets you test THIS module by itself, without the full tool:
-#   python3 modules/port_scan.py
 if __name__ == "__main__":
-    import json
-    test_target = "scanme.nmap.org"   # Nmap's legal test host
-    print(f"[*] Standalone test scan on {test_target}\n")
-    output = run(test_target, verbose=True)
-    print("\n[*] Returned dictionary:")
-    print(json.dumps(output, indent=2))
+    import json, sys
+    t = sys.argv[1] if len(sys.argv) > 1 else "scanme.nmap.org"
+    print(f"[*] Standalone port scan on {t}\n")
+    print(json.dumps(run(t, verbose=True), indent=2))

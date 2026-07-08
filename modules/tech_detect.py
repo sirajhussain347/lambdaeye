@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 tech_detect.py - Active recon module: web technology detection.
-Fingerprints a website's tech stack from headers, cookies, HTML body,
-and a few well-known probe paths. Extracts version numbers and reports
-raw values of revealing headers so nothing useful is discarded.
+
+Fingerprints a website's tech stack from HTTP headers, cookies, HTML body
+signatures, and well-known probe paths. Reports results grouped by category
+grouped by category, with the evidence behind each detection.
+
+Part of the LambdaEye tool (active recon).
 Contract: exposes run(target, verbose=False) and returns a dict.
 Requires: requests
 """
@@ -14,107 +17,239 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+# --- Category constants (for grouped output, improvement #13) ---------------
+WEB_SERVER = "Web Server"
+LANGUAGE = "Programming Language"
+FRAMEWORK = "Framework"
+CMS = "CMS"
+FRONTEND = "Frontend"
+CDN = "CDN / Proxy"
+SECURITY = "Security"
+OTHER = "Other"
+
+
+# --- Server header signatures: needle -> (clean name, category) -------------
 SERVER_SIGNATURES = {
-    "nginx": "nginx", "apache": "Apache", "openresty": "OpenResty (nginx + Lua)",
-    "litespeed": "LiteSpeed", "microsoft-iis": "Microsoft IIS", "iis": "Microsoft IIS",
-    "cloudflare": "Cloudflare (CDN)", "cloudfront": "AWS CloudFront (CDN)",
-    "gws": "Google Web Server", "caddy": "Caddy", "tengine": "Tengine (nginx fork)",
-    "gunicorn": "Gunicorn (Python)", "werkzeug": "Werkzeug (Python/Flask)",
-    "kestrel": "Kestrel (ASP.NET Core)", "vercel": "Vercel",
+    "nginx": ("Nginx", WEB_SERVER),
+    "apache": ("Apache", WEB_SERVER),
+    "openresty": ("OpenResty (nginx + Lua)", WEB_SERVER),
+    "litespeed": ("LiteSpeed", WEB_SERVER),
+    "microsoft-iis": ("Microsoft IIS", WEB_SERVER),
+    "iis": ("Microsoft IIS", WEB_SERVER),
+    "caddy": ("Caddy", WEB_SERVER),
+    "tengine": ("Tengine (nginx fork)", WEB_SERVER),
+    "gunicorn": ("Gunicorn (Python)", WEB_SERVER),
+    "werkzeug": ("Werkzeug (Python/Flask)", WEB_SERVER),
+    "kestrel": ("Kestrel (ASP.NET Core)", WEB_SERVER),
+    "cloudflare": ("Cloudflare (CDN)", CDN),
+    "cloudfront": ("AWS CloudFront (CDN)", CDN),
+    "gws": ("Google Web Server", WEB_SERVER),
+    "vercel": ("Vercel", CDN),
 }
 
-REVEALING_HEADERS = {
-    "x-powered-by": "X-Powered-By", "x-generator": "Generator",
-    "x-aspnet-version": "ASP.NET version", "x-aspnetmvc-version": "ASP.NET MVC version",
-    "x-drupal-cache": "Drupal (cache header)", "x-drupal-dynamic-cache": "Drupal",
-    "x-shopify-stage": "Shopify", "x-varnish": "Varnish (cache)",
-    "via": "Proxy/CDN (Via)", "x-served-by": "Served-By (CDN)",
-    "cf-cache-status": "Cloudflare (CDN)", "x-vercel-id": "Vercel (hosting)",
-    "x-nextjs-cache": "Next.js", "x-github-request-id": "GitHub",
-    "fastly-debug-digest": "Fastly (CDN)",
+# VALUE headers: value is a version/name -> keep the value. (label, category)
+VALUE_HEADERS = {
+    "x-powered-by": ("X-Powered-By", LANGUAGE),
+    "x-generator": ("Generator", CMS),
+    "x-aspnet-version": ("ASP.NET", LANGUAGE),
+    "x-aspnetmvc-version": ("ASP.NET MVC", FRAMEWORK),
+    "x-runtime": ("Ruby (X-Runtime)", LANGUAGE),
 }
 
+# PRESENCE headers (Bug 3 fix): value is a trace/ID -> report label only.
+# (label, category)
+PRESENCE_HEADERS = {
+    "x-github-request-id": ("GitHub", OTHER),
+    "cf-ray": ("Cloudflare (CDN)", CDN),
+    "cf-cache-status": ("Cloudflare (CDN)", CDN),
+    "x-vercel-id": ("Vercel", CDN),
+    "x-served-by": ("CDN (Served-By)", CDN),
+    "x-fastly-request-id": ("Fastly (CDN)", CDN),
+    "fastly-debug-digest": ("Fastly (CDN)", CDN),
+    "x-akamai-request-id": ("Akamai (CDN)", CDN),
+    "x-sucuri-id": ("Sucuri (WAF/CDN)", SECURITY),
+    "x-imperva-id": ("Imperva (WAF)", SECURITY),
+    "x-bunnycdn": ("BunnyCDN", CDN),
+    "x-drupal-cache": ("Drupal", CMS),
+    "x-drupal-dynamic-cache": ("Drupal", CMS),
+    "x-shopify-stage": ("Shopify", CMS),
+    "x-varnish": ("Varnish (cache)", CDN),
+    "x-nextjs-cache": ("Next.js", FRAMEWORK),
+    "x-request-id": ("Rails/Request-ID", FRAMEWORK),
+    "via": ("Proxy/CDN present", CDN),
+    "alt-svc": ("HTTP/3 (alt-svc)", OTHER),
+}
+
+# Cookie name substring -> (tech, category)
 COOKIE_SIGNATURES = {
-    "phpsessid": "PHP", "wordpress_": "WordPress", "wp-settings": "WordPress",
-    "woocommerce": "WooCommerce (WordPress)", "laravel_session": "Laravel (PHP)",
-    "xsrf-token": "Laravel/Angular (XSRF token)", "ci_session": "CodeIgniter (PHP)",
-    "asp.net_sessionid": "ASP.NET", ".aspxauth": "ASP.NET",
-    "jsessionid": "Java (JSP/Servlet)", "connect.sid": "Express.js (Node)",
-    "__cfduid": "Cloudflare (CDN)", "_shopify": "Shopify",
-    "django": "Django (Python)", "csrftoken": "Django (Python)",
+    "phpsessid": ("PHP", LANGUAGE),
+    "wordpress_": ("WordPress", CMS),
+    "wp-settings": ("WordPress", CMS),
+    "woocommerce": ("WooCommerce", CMS),
+    "laravel_session": ("Laravel (PHP)", FRAMEWORK),
+    "ci_session": ("CodeIgniter (PHP)", FRAMEWORK),
+    "asp.net_sessionid": ("ASP.NET", LANGUAGE),
+    ".aspxauth": ("ASP.NET", LANGUAGE),
+    "jsessionid": ("Java (JSP/Servlet)", LANGUAGE),
+    "connect.sid": ("Express.js (Node)", FRAMEWORK),
+    "__cfduid": ("Cloudflare (CDN)", CDN),
+    "_shopify": ("Shopify", CMS),
+    "django": ("Django (Python)", FRAMEWORK),
+    "csrftoken": ("Django (Python)", FRAMEWORK),
 }
 
+# Body substring -> (tech, category)
 BODY_SIGNATURES = {
-    "/wp-content/": "WordPress", "/wp-includes/": "WordPress", "wp-json": "WordPress",
-    'content="wordpress': "WordPress", 'content="drupal': "Drupal",
-    'content="joomla': "Joomla", "__next_data__": "Next.js (React)",
-    "/_next/static": "Next.js (React)", "ng-version": "Angular",
-    "data-reactroot": "React", "react.production.min": "React",
-    "__nuxt__": "Nuxt.js (Vue)", "vue.runtime": "Vue.js", "csrf-param": "Ruby on Rails",
-    "cdn.shopify.com": "Shopify", "static.parastorage.com": "Wix",
-    "squarespace.com": "Squarespace", "gatsby": "Gatsby (React)",
-    "bootstrap.min.css": "Bootstrap (CSS)", "jquery": "jQuery",
+    "/wp-content/": ("WordPress", CMS),
+    "/wp-includes/": ("WordPress", CMS),
+    "wp-json": ("WordPress", CMS),
+    'content="drupal': ("Drupal", CMS),
+    'content="joomla': ("Joomla", CMS),
+    "__next_data__": ("Next.js (React)", FRAMEWORK),
+    "/_next/static": ("Next.js (React)", FRAMEWORK),
+    'id="__next"': ("Next.js (React)", FRAMEWORK),
+    "ng-version": ("Angular", FRAMEWORK),
+    "ng-app": ("Angular", FRAMEWORK),
+    "data-reactroot": ("React", FRONTEND),
+    'id="root"': ("React (likely)", FRONTEND),
+    "__nuxt__": ("Nuxt.js (Vue)", FRAMEWORK),
+    "data-v-": ("Vue.js", FRONTEND),
+    "csrf-param": ("Ruby on Rails", FRAMEWORK),
+    "cdn.shopify.com": ("Shopify", CMS),
+    "static.parastorage.com": ("Wix", CMS),
+    "squarespace.com": ("Squarespace", CMS),
+    "gatsby": ("Gatsby (React)", FRAMEWORK),
+    # More CMS (improvement #11)
+    "/skin/frontend/": ("Magento", CMS),
+    "mage/cookies": ("Magento", CMS),
+    "ghost-": ("Ghost", CMS),
+    "content=\"typo3": ("TYPO3", CMS),
+    "/typo3temp/": ("TYPO3", CMS),
+    "craftcms": ("Craft CMS", CMS),
+    "prestashop": ("PrestaShop", CMS),
+    "opencart": ("OpenCart", CMS),
+    "/mediawiki/": ("MediaWiki", CMS),
+    "blogger.com": ("Blogger", CMS),
 }
 
-# Well-known probe paths: if they exist / contain a marker, they confirm a stack.
-# Format: path -> (marker_substring_in_response, technology_label)
-# marker "" means "a 200 OK on this path alone is the signal".
+# JS library regexes (improvement #1) -> (tech, category)
+JS_REGEX = {
+    r"jquery(?:[-.]\d+\.\d+\.\d+)?(?:\.min)?\.js": ("jQuery", FRONTEND),
+    r"bootstrap(?:\.bundle)?(?:[-.]\d+\.\d+\.\d+)?(?:\.min)?\.(?:js|css)": ("Bootstrap", FRONTEND),
+    r"vue(?:\.runtime)?(?:\.min)?\.js": ("Vue.js", FRONTEND),
+    r"react(?:\.production)?(?:\.min)?\.js": ("React", FRONTEND),
+    r"angular(?:\.min)?\.js": ("Angular", FRAMEWORK),
+    r"font-?awesome": ("Font Awesome", FRONTEND),
+}
+
+# Probe paths (improvement #9): path -> (marker, tech, category)
+# marker "" means a 200 alone is the signal.
 PROBE_PATHS = {
-    "/wp-login.php":     ("", "WordPress (login page present)"),
-    "/administrator/":   ("joomla", "Joomla (admin present)"),
-    "/robots.txt":       ("wp-admin", "WordPress (robots.txt)"),
-    "/.git/config":      ("[core]", "Exposed .git directory (!)"),
-    "/wp-json/":         ("wp/v2", "WordPress REST API"),
+    "/wp-login.php":   ("", ("WordPress (login page)", CMS)),
+    "/robots.txt":     ("wp-admin", ("WordPress (robots.txt)", CMS)),
+    "/wp-json/":       ("wp/v2", ("WordPress REST API", CMS)),
+    "/administrator/": ("joomla", ("Joomla (admin)", CMS)),
+    "/sitemap.xml":    ("<urlset", ("XML sitemap present", OTHER)),
+    "/.git/config":    ("[core]", ("Exposed .git directory (!)", SECURITY)),
+    "/.env":           ("APP_KEY", ("Exposed .env file (!)", SECURITY)),
+    "/server-status":  ("Apache Server Status", ("Apache mod_status exposed (!)", SECURITY)),
+    "/graphql":        ("", ("GraphQL endpoint", FRAMEWORK)),
+}
+
+# Security headers to check (improvement #6): header -> friendly name
+SECURITY_HEADERS = {
+    "strict-transport-security": "HSTS",
+    "content-security-policy": "CSP",
+    "x-frame-options": "X-Frame-Options",
+    "x-content-type-options": "X-Content-Type-Options",
+    "referrer-policy": "Referrer-Policy",
+    "permissions-policy": "Permissions-Policy",
 }
 
 
-def _match_server(server_value):
+def _add(found, tech, category, evidence):
+    """Record a detection with its category and accumulate evidence."""
+    key = (tech, category)
+    if key not in found:
+        found[key] = set()
+    found[key].add(evidence)
+
+
+def _match_server(server_value, hostname):
     low = server_value.lower()
-    for needle, label in SERVER_SIGNATURES.items():
+    if low == hostname.lower():
+        return None  # hostname echo, not a real banner (Bug 5-adjacent)
+    for needle, (clean, category) in SERVER_SIGNATURES.items():
         if needle in low:
             m = re.search(r"[\d]+\.[\d]+(?:\.[\d]+)?", server_value)
             version = f" {m.group(0)}" if m else ""
-            return f"{label}{version}"
-    return f"Server: {server_value}"
+            return (f"{clean}{version}", category)
+    return (f"{server_value}", WEB_SERVER)
 
 
-def _scan_response(resp, found):
-    """Inspect one response's headers, cookies, and body; add hits to `found`."""
+def _scan_response(resp, found, hostname):
     lower_headers = {k.lower(): v for k, v in resp.headers.items()}
 
+    # Server header (improvement #5: clean names)
     if "server" in lower_headers and lower_headers["server"].strip():
-        found.add(_match_server(lower_headers["server"]))
+        srv = _match_server(lower_headers["server"], hostname)
+        if srv:
+            _add(found, srv[0], srv[1], f"Server header: {lower_headers['server']}")
 
-    for hkey, label in REVEALING_HEADERS.items():
+    # Value headers
+    for hkey, (label, cat) in VALUE_HEADERS.items():
+        if hkey in lower_headers and lower_headers[hkey].strip():
+            _add(found, f"{label}: {lower_headers[hkey].strip()}", cat,
+                 f"{hkey} header")
+
+    # Presence headers (Bug 3: label only)
+    for hkey, (label, cat) in PRESENCE_HEADERS.items():
         if hkey in lower_headers:
-            val = lower_headers[hkey].strip()
-            found.add(f"{label}: {val}" if val else label)
+            _add(found, label, cat, f"{hkey} header present")
 
+    # Cookies
     for cookie in resp.cookies:
         cname = cookie.name.lower()
-        for needle, label in COOKIE_SIGNATURES.items():
+        for needle, (label, cat) in COOKIE_SIGNATURES.items():
             if needle in cname:
-                found.add(label)
+                _add(found, label, cat, f"cookie: {cookie.name}")
 
+    # Body signatures
     body = resp.text.lower()
-    for needle, label in BODY_SIGNATURES.items():
+    for needle, (label, cat) in BODY_SIGNATURES.items():
         if needle in body:
-            found.add(label)
+            _add(found, label, cat, f"body contains '{needle}'")
+
+    # JS library regexes (improvement #1)
+    for pattern, (label, cat) in JS_REGEX.items():
+        if re.search(pattern, body):
+            _add(found, label, cat, f"JS/CSS match: {pattern}")
+
+
+def _check_security_headers(resp):
+    """Improvement #6: return dict of {friendly_name: present_bool}."""
+    lower = {k.lower() for k in resp.headers.keys()}
+    return {name: (hkey in lower) for hkey, name in SECURITY_HEADERS.items()}
 
 
 def run(target, verbose=False):
     """Main entry point (matches the team contract)."""
     results = {
         "module": "tech_detect", "status": "success", "target": target,
-        "data": {"url": None, "status_code": None, "technologies": [],
-                 "raw_headers": {}, "probes": []},
+        "data": {"url": None, "status_code": None,
+                 "technologies": [],        # flat list (backwards-compatible)
+                 "by_category": {},         # grouped (improvement #13)
+                 "detections": [],          # with evidence (#17)
+                 "security_headers": {},    # improvement #6
+                 "probes": [], "raw_headers": {}},
     }
 
     base = target if target.startswith("http") else f"https://{target}"
     results["data"]["url"] = base
-    ua = {"User-Agent": "Mozilla/5.0 (LambdaRecon)"}
+    ua = {"User-Agent": "Mozilla/5.0 (LambdaEye)"}
+    hostname = target.replace("https://", "").replace("http://", "").split("/")[0]
 
-    # --- Main page fetch (with http fallback) ---
     try:
         resp = requests.get(base, headers=ua, timeout=10,
                             allow_redirects=True, verify=False)
@@ -123,55 +258,87 @@ def run(target, verbose=False):
             base = f"http://{target}"
             resp = requests.get(base, headers=ua, timeout=10, allow_redirects=True)
             results["data"]["url"] = base
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e2:
             results["status"] = "error"
-            results["data"]["error"] = f"Could not connect: {e}"
-            print(f"[TECH]   ERROR: could not connect to {target}")
+            # Improvement #16: clearer error category
+            msg = str(e2)
+            if "timed out" in msg.lower():
+                reason = "connection timed out"
+            elif "name or service" in msg.lower() or "resolve" in msg.lower():
+                reason = "DNS resolution failed"
+            elif "ssl" in msg.lower():
+                reason = "SSL/TLS error"
+            else:
+                reason = "connection failed"
+            results["data"]["error"] = f"{reason}: {target}"
+            print(f"[TECH]   ERROR: {reason} -> {target}")
             return results
 
     results["data"]["status_code"] = resp.status_code
     results["data"]["raw_headers"] = dict(resp.headers)
 
-    found = set()
-    _scan_response(resp, found)              # scan the homepage
+    found = {}   # {(tech, category): set(evidence)}
+    _scan_response(resp, found, hostname)
 
-    # --- Probe well-known paths for extra confirmation ---
+    # Probe paths
     root = results["data"]["url"].rstrip("/")
-    for path, (marker, label) in PROBE_PATHS.items():
+    for path, (marker, (label, cat)) in PROBE_PATHS.items():
         try:
             pr = requests.get(root + path, headers=ua, timeout=6,
                               allow_redirects=False, verify=False)
-            hit = False
-            if pr.status_code == 200:
-                if marker == "" or marker in pr.text.lower():
-                    hit = True
-            if hit:
-                found.add(label)
-                results["data"]["probes"].append({"path": path, "status": pr.status_code})
+            if pr.status_code == 200 and (marker == "" or marker in pr.text.lower()):
+                _add(found, label, cat, f"path {path} -> 200")
+                results["data"]["probes"].append({"path": path, "status": 200})
                 if verbose:
-                    print(f"[TECH]   Probe {path} -> {pr.status_code}  MATCH ({label})")
+                    print(f"[TECH]   Probe {path} -> 200  MATCH ({label})")
             elif verbose:
                 print(f"[TECH]   Probe {path} -> {pr.status_code}")
         except requests.exceptions.RequestException:
             if verbose:
                 print(f"[TECH]   Probe {path} -> (no response)")
 
-    results["data"]["technologies"] = sorted(found)
+    # Security headers (improvement #6)
+    results["data"]["security_headers"] = _check_security_headers(resp)
 
-    # --- Output ---
+    # Build the three output views
+    by_category = {}
+    detections = []
+    flat = []
+    for (tech, category), evidence in sorted(found.items()):
+        by_category.setdefault(category, []).append(tech)
+        detections.append({
+            "technology": tech, "category": category,
+            "evidence": sorted(evidence),
+        })
+        flat.append(tech)
+
+    results["data"]["by_category"] = by_category
+    results["data"]["detections"] = detections
+    results["data"]["technologies"] = sorted(set(flat))
+
+    # --- Output (improvement #13: grouped by category) ---
     print(f"[TECH]   URL: {results['data']['url']}  (HTTP {resp.status_code})")
-    if found:
-        for tech in sorted(found):
-            print(f"[TECH]   Detected -> {tech}")
+    if by_category:
+        for category in [WEB_SERVER, LANGUAGE, FRAMEWORK, CMS, FRONTEND, CDN, SECURITY, OTHER]:
+            if category in by_category:
+                print(f"[TECH]   {category}:")
+                for tech in sorted(set(by_category[category])):
+                    print(f"[TECH]     - {tech}")
     else:
         print("[TECH]   No technologies disclosed by target.")
 
-    if verbose:
-        print("\n[TECH]   Notable response headers:")
-        for h in ("Server", "X-Powered-By", "X-Generator", "Via",
-                  "X-Served-By", "CF-Cache-Status", "Set-Cookie"):
-            if h in resp.headers:
-                print(f"[TECH]     {h}: {resp.headers[h][:110]}")
+    # Security header summary
+    sec = results["data"]["security_headers"]
+    print(f"[TECH]   Security headers:")
+    for name, present in sec.items():
+        mark = "OK " if present else "-- "
+        print(f"[TECH]     [{mark}] {name}")
+
+    if verbose and detections:
+        print("\n[TECH]   Evidence:")
+        for d in detections:
+            print(f"[TECH]     {d['technology']}: "
+                  f"{', '.join(d['evidence'])}")
 
     return results
 
@@ -181,5 +348,4 @@ if __name__ == "__main__":
     t = sys.argv[1] if len(sys.argv) > 1 else "wordpress.org"
     print(f"[*] Standalone tech-detect test on {t}\n")
     out = run(t, verbose=True)
-    print("\n[*] Detected technologies:")
-    print(json.dumps(out["data"]["technologies"], indent=2))
+    print("\n[*] By category:", json.dumps(out["data"]["by_category"], indent=2))

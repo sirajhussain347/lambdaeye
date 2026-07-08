@@ -1,108 +1,88 @@
 #!/usr/bin/env python3
 """
-banner_grab.py — Active recon module: service banner grabbing.
-
-Connects to open ports and reads the banner the service sends back,
-revealing software name/version where the target discloses it.
+banner_grab.py - Active recon module: service banner grabbing.
+Connects to open ports and reads the banner the service sends back.
 Handles plain HTTP, encrypted HTTPS (TLS), and talkative services
-(SSH/FTP/SMTP). Part of the LambdaRecon tool (active recon).
+(SSH/FTP/SMTP). Part of the LambdaEye tool (active recon).
 
-Contract: exposes run(target, verbose=False) and returns a dict.
+Contract: exposes run(target, verbose=False, ports=None) and returns a dict.
 """
 
-import socket   # built-in: networking
-import ssl      # built-in: wraps a socket for encrypted (TLS) connections
+import socket
+import ssl
 
-
-# Ports that speak encrypted TLS and must be wrapped with ssl.
 TLS_PORTS = {443, 8443}
-# Plain-text web ports: need an HTTP request but no encryption.
 HTTP_PORTS = {80, 8080}
 
 
 def _read_all(sock, timeout=3.0):
-    """
-    Keep reading from the socket until the server stops sending.
-    Servers often split their response across multiple packets, so a
-    single recv() can miss data (Problem 2 from the review). This loops
-    until the connection closes or times out, then returns all bytes.
-    """
     sock.settimeout(timeout)
     chunks = b""
     while True:
         try:
             data = sock.recv(4096)
-            if not data:          # empty = server finished sending
+            if not data:
                 break
             chunks += data
         except socket.timeout:
-            break                 # no more data arriving; stop waiting
+            break
     return chunks
 
 
-def _extract_server(raw_text):
+def _extract_http_server(raw_text, hostname):
     """
-    Pull the value of the 'Server:' header out of an HTTP response.
-    Returns just the software string (e.g. 'nginx/1.26.1'), or if the
-    server hides its identity, falls back to the status line so we still
-    report *something* (Problem 3 + Problem 5 from the review).
+    Pull the Server header value from an HTTP response.
+    Bug 5 fix: if the Server value is just the hostname (e.g. 'github.com'),
+    that's not a real banner -- return the status line or a TLS note instead.
     """
     server = None
     for line in raw_text.splitlines():
         if line.lower().startswith("server:"):
-            # split on the first colon, keep the value side, trim spaces
             server = line.split(":", 1)[1].strip()
             break
 
+    # Bug 5: reject useless "banners" that just echo the hostname.
     if server:
-        return server
+        if server.lower() == hostname.lower():
+            # Not informative -- fall through to status line instead.
+            server = None
+        else:
+            return server
 
-    # No Server header (often deliberately hidden) — return status line.
+    # Fall back to the HTTP status line (e.g. "HTTP/1.1 200 OK").
     lines = raw_text.splitlines()
-    return lines[0].strip() if lines else None
+    if lines and lines[0].startswith("HTTP"):
+        return lines[0].strip()
+    return None
 
 
 def grab_banner(hostname, ip, port, timeout=3.0):
-    """
-    Connect to ONE open port and try to read its banner.
-
-    hostname : the domain (used in the Host header + TLS SNI)
-    ip       : resolved IP to actually connect to
-    port     : the port number
-
-    Returns banner/server string, or None.
-    """
     try:
-        # create_connection handles the socket + connect in one step.
         sock = socket.create_connection((ip, port), timeout)
 
-        # Encrypted ports: wrap the socket in TLS before talking.
         if port in TLS_PORTS:
             context = ssl.create_default_context()
-            # We only want the banner, not to verify the cert, so relax checks.
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-            # server_hostname (SNI) lets multi-site servers pick the right cert.
             sock = context.wrap_socket(sock, server_hostname=hostname)
 
         if port in TLS_PORTS or port in HTTP_PORTS:
-            # --- Web ports: send a proper GET request ---
-            # GET (not HEAD) tends to return more headers. The Host header
-            # carries the DOMAIN NAME, not the IP, so virtual-hosted servers
-            # know which site we mean (Problem 1 from the review).
             request = (
                 f"GET / HTTP/1.1\r\n"
                 f"Host: {hostname}\r\n"
-                f"User-Agent: Mozilla/5.0 (LambdaRecon)\r\n"
+                f"User-Agent: Mozilla/5.0 (LambdaEye)\r\n"
                 f"Accept: */*\r\n"
                 f"Connection: close\r\n\r\n"
             )
             sock.sendall(request.encode())
             raw = _read_all(sock).decode(errors="ignore")
             sock.close()
-            return _extract_server(raw)
+            result = _extract_http_server(raw, hostname)
+            # Bug 5: for TLS, if we still have nothing useful, note it's TLS.
+            if result is None and port in TLS_PORTS:
+                return "TLS service (no server banner disclosed)"
+            return result
         else:
-            # --- Talkative services (SSH/FTP/SMTP): they greet first ---
             raw = _read_all(sock).decode(errors="ignore").strip()
             sock.close()
             return raw.splitlines()[0].strip() if raw else None
@@ -120,17 +100,25 @@ def run(target, verbose=False, ports=None):
         "data": {"resolved_ip": None, "banners": []},
     }
 
-    # Resolve the domain to an IP (sockets connect to IPs).
+    # Bug 4 fix: resolve first, and if it fails, print a clear message
+    # instead of returning silently.
     try:
         ip = socket.gethostbyname(target)
         results["data"]["resolved_ip"] = ip
     except socket.gaierror:
         results["status"] = "error"
-        results["data"]["error"] = f"Could not resolve host: {target}"
+        results["data"]["error"] = f"Target could not be resolved: {target}"
+        print(f"[BANNER] ERROR: target could not be resolved -> {target}")
         return results
 
+    # Improvement 1: if a list of open ports was passed in (from the port
+    # scanner), only grab banners on those. Otherwise use a default set.
     if ports is None:
         ports = [21, 22, 25, 80, 110, 143, 443, 8080, 8443]
+
+    if not ports:
+        print("[BANNER] No open ports to grab banners from.")
+        return results
 
     if verbose:
         print(f"[BANNER] Resolved {target} -> {ip}")
@@ -145,18 +133,17 @@ def run(target, verbose=False, ports=None):
         elif verbose:
             print(f"[BANNER] Port {port:<5} -> (no banner)")
 
-    if verbose:
-        n = len(results["data"]["banners"])
-        print(f"\n[BANNER] Done. {n} banner(s) retrieved.")
+    # Bug 4 (extended): if nothing was found at all, say so clearly.
+    if not results["data"]["banners"]:
+        print("[BANNER] No reachable services returned a banner.")
+    elif verbose:
+        print(f"\n[BANNER] Done. {len(results['data']['banners'])} banner(s) retrieved.")
 
     return results
 
 
-# Standalone test:  python3 modules/banner_grab.py [target]
 if __name__ == "__main__":
     import json, sys
-    test_target = sys.argv[1] if len(sys.argv) > 1 else "scanme.nmap.org"
-    print(f"[*] Standalone banner test on {test_target}\n")
-    output = run(test_target, verbose=True)
-    print("\n[*] Returned dictionary:")
-    print(json.dumps(output, indent=2))
+    t = sys.argv[1] if len(sys.argv) > 1 else "scanme.nmap.org"
+    print(f"[*] Standalone banner test on {t}\n")
+    print(json.dumps(run(t, verbose=True), indent=2))

@@ -16,9 +16,9 @@ LambdaEye automates the initial information-gathering phase of a security assess
 - **Subdomain enumeration** — passive subdomain discovery from public OSINT sources (crt.sh, AlienVault OTX, HackerTarget, Anubis). No brute forcing.
 
 ### Active Reconnaissance
-- **Port scanning** — socket-based TCP scanner over common ports, with hostname-to-IP resolution.
-- **Banner grabbing** — reads service banners from open ports, with TLS-aware handling for HTTPS so encrypted services can be fingerprinted.
-- **Technology detection** — fingerprints a website's stack from HTTP headers, cookies, HTML body signatures, and well-known probe paths (e.g. `/wp-login.php`, `/robots.txt`). Extracts version numbers where disclosed.
+- **Port scanning** — socket-based TCP scanner with selectable coverage (common ports, top 100, top 1000, or a custom range) and hostname-to-IP resolution.
+- **Banner grabbing** — reads service banners from open ports, with TLS-aware handling for HTTPS so encrypted services can be fingerprinted. Reuses the port scanner's open-port results when run together.
+- **Technology detection** — fingerprints a website's stack from HTTP headers, cookies, HTML body signatures, and well-known probe paths (e.g. `/wp-login.php`, `/robots.txt`). Groups results by category, checks security headers, and records the evidence behind each detection.
 
 ### Reporting
 - Generates reports in both **`.txt`** and **`.html`** formats.
@@ -72,18 +72,39 @@ python3 recon.py <target> [flags]
 
 ### Flags
 
+**Passive Reconnaissance**
+
 | Flag            | Description                                        |
 |-----------------|----------------------------------------------------|
 | `--whois`       | Run a WHOIS lookup                                  |
 | `--dns`         | Enumerate DNS records (A, MX, TXT, NS)             |
 | `--subdomains`  | Passive subdomain enumeration                      |
+
+**Active Reconnaissance**
+
+| Flag            | Description                                        |
+|-----------------|----------------------------------------------------|
 | `--ports`       | Scan for open ports                                |
 | `--banner`      | Grab service banners from open ports               |
 | `--tech`        | Detect web technologies in use                     |
-| `--all`         | Run every available module                         |
-| `--report`      | Save results to `reports/` as `.txt` and `.html`   |
-| `-v`, `--verbose` | Show detailed output while running               |
-| `-h`, `--help`  | Show the help menu                                 |
+
+**Port Scan Options**
+
+| Flag                              | Description                                                        |
+|-----------------------------------|-------------------------------------------------------------------|
+| `--port-profile {common,top100,top1000}` | Choose which set of ports to scan (default: `common`)      |
+| `--port-range START-END`          | Scan a custom port range, e.g. `--port-range 1-1024`             |
+
+**General Options**
+
+| Flag              | Description                                        |
+|-------------------|----------------------------------------------------|
+| `--all`           | Run every available module                         |
+| `--report`        | Save results to `reports/` as `.txt` and `.html`   |
+| `-v`, `--verbose` | Show detailed output while running                 |
+| `-h`, `--help`    | Show the help menu                                 |
+
+> **Port coverage:** `common` scans a small curated list of well-known ports (fast). `top100` and `top1000` widen the search, and `--port-range` lets you specify any range explicitly (e.g. `1-65535` for a full scan). `--port-range` takes precedence over `--port-profile` when both are given.
 
 ### Examples
 
@@ -96,6 +117,12 @@ python3 recon.py example.com --whois --dns --subdomains
 
 # Active recon with detailed output
 python3 recon.py example.com --ports --banner --tech -v
+
+# Port scan using the top 1000 ports
+python3 recon.py example.com --ports --port-profile top1000
+
+# Port scan over a custom range
+python3 recon.py example.com --ports --port-range 1-1024
 
 # A single module
 python3 recon.py example.com --subdomains
@@ -180,8 +207,10 @@ docker run --rm lambdaeye example.com --ports --banner --tech -v
 [PORTS] Port 80    OPEN   (HTTP)
 [PORTS] Port 443   OPEN   (HTTPS)
 [BANNER] Port 443  -> openresty
-[TECH]   Detected -> OpenResty (nginx + Lua)
-[TECH]   Detected -> WordPress
+[TECH]   Web Server:
+[TECH]     - OpenResty (nginx + Lua)
+[TECH]   CMS:
+[TECH]     - WordPress
 [WHOIS]  Registrar     : Example Registrar Inc
 [DNS]    A    93.184.216.34
 [SUBDOM] Found 12 unique subdomain(s).
@@ -212,7 +241,7 @@ lambdaeye/
 ├── utils/
 │   └── reporter.py       # Builds .txt and .html reports
 ├── reports/              # Generated reports (git-ignored)
-├── Dockerfile             # Container build for running LambdaEye without local Python setup
+├── Dockerfile            # Container build for running LambdaEye without local Python setup
 ├── requirements.txt
 └── README.md
 ```

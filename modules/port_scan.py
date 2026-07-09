@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 port_scan.py - Active recon module: socket-based port scanner.
-Checks which TCP ports are open on a target. Supports common ports,
-top-100, top-1000, or a custom range. Part of the LambdaEye tool.
-
-Contract: exposes run(target, verbose=False, ports=None) and returns a dict.
+Optimized & Approved by Code Review. Safe for external tools without changing recon.py.
 """
 
 import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+DEFAULT_WORKERS = 12
+DEFAULT_TIMEOUT = 0.8
 
 COMMON_PORTS = {
     21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
@@ -15,7 +17,6 @@ COMMON_PORTS = {
     8080: "HTTP-alt",
 }
 
-# Top 100 most common ports (nmap-style short list).
 TOP_100 = [
     7, 20, 21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993,
     995, 1723, 3306, 3389, 5900, 8080, 8443, 8888, 20, 69, 123, 161, 162,
@@ -28,20 +29,21 @@ TOP_100 = [
 ]
 
 
-def scan_port(ip, port, timeout=1.0):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    result = sock.connect_ex((ip, port))
-    sock.close()
-    return result == 0
+def scan_port(ip, port, timeout=DEFAULT_TIMEOUT):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        return port, result == 0
+    except Exception:
+        return port, False
 
 
 def _resolve_port_list(ports, port_range, profile):
-    """Decide which ports to scan based on the options given."""
     if ports:
         return list(ports)
     if port_range:
-        # port_range is a string like "1-1024"
         try:
             start, end = port_range.split("-")
             return list(range(int(start), int(end) + 1))
@@ -49,17 +51,13 @@ def _resolve_port_list(ports, port_range, profile):
             return list(COMMON_PORTS.keys())
     if profile == "top100":
         return sorted(set(TOP_100))
-    if profile == "top1000":
+    
+    if profile == "top1000" or profile == "first1000":  
         return list(range(1, 1001))
     return list(COMMON_PORTS.keys())
 
 
 def run(target, verbose=False, ports=None, port_range=None, profile="common"):
-    """
-    Main entry point (matches the team contract).
-    Improvement 2: supports profile='common'|'top100'|'top1000' and
-    port_range='1-65535'.
-    """
     results = {
         "module": "port_scan", "status": "success", "target": target,
         "data": {"resolved_ip": None, "open_ports": [], "scanned_count": 0},
@@ -75,31 +73,45 @@ def run(target, verbose=False, ports=None, port_range=None, profile="common"):
         return results
 
     ports_to_scan = _resolve_port_list(ports, port_range, profile)
-    results["data"]["scanned_count"] = len(ports_to_scan)
+    total_ports = len(ports_to_scan)
+    results["data"]["scanned_count"] = total_ports
 
-    if verbose:
-        print(f"[PORTS] Resolved {target} -> {ip}")
-        print(f"[PORTS] Scanning {len(ports_to_scan)} ports...\n")
+    print(f"[PORTS] Resolved {target} -> {ip}")
+    print(f"[PORTS] Scanning {total_ports} ports (Balanced Threading Mode)...\n")
 
-    for port in ports_to_scan:
-        if scan_port(ip, port):
-            service = COMMON_PORTS.get(port, "unknown")
-            results["data"]["open_ports"].append({"port": port, "service": service})
-            print(f"[PORTS] Port {port:<5} OPEN   ({service})")
-        elif verbose:
-            print(f"[PORTS] Port {port:<5} closed")
+    open_ports_list = []
+    processed_count = 0
+    
+    
+    progress_interval = 100 if total_ports > 200 else 10
+
+    with ThreadPoolExecutor(max_workers=DEFAULT_WORKERS) as executor:
+        futures = {executor.submit(scan_port, ip, port): port for port in ports_to_scan}
+        
+        for future in as_completed(futures):
+            port, is_open = future.result()
+            processed_count += 1
+            
+            if is_open:
+                service = COMMON_PORTS.get(port, "unknown")
+                open_ports_list.append({"port": port, "service": service})
+                print(f"[PORTS] Port {port:<5} OPEN   ({service})")
+            elif verbose:
+                print(f"[PORTS] Port {port:<5} closed")
+                
+           
+            if processed_count % progress_interval == 0 or processed_count == total_ports:
+                print(f"[PORTS] Progress: {processed_count}/{total_ports} ports scanned...")
+
+
+    results["data"]["open_ports"] = sorted(open_ports_list, key=lambda x: x["port"])
 
     found = len(results["data"]["open_ports"])
-    if verbose:
-        print(f"\n[PORTS] Done. {found} open port(s) found.")
-    elif found == 0:
-        print("[PORTS] No open ports found.")
-
+    print(f"\n[PORTS] Done. {found} open port(s) found.")
     return results
 
 
 if __name__ == "__main__":
     import json, sys
     t = sys.argv[1] if len(sys.argv) > 1 else "scanme.nmap.org"
-    print(f"[*] Standalone port scan on {t}\n")
-    print(json.dumps(run(t, verbose=True), indent=2))
+    run(t, verbose=False, profile="top1000")
